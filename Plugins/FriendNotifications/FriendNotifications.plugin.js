@@ -190,7 +190,7 @@ module.exports = (_ => {
 									children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.TextElement, {
 										children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.TextScroller, {
 											speed: 1,
-											children: BDFDB.ReactUtils.elementToReact(BDFDB.DOMUtils.create(log.string))
+											children: BDFDB.ReactUtils.elementToReact(BDFDB.DOMUtils.create(log.string || `<strong>${BDFDB.StringUtils.htmlEscape(log.name || "Unknown")}</strong> changed status to <strong>${BDFDB.StringUtils.htmlEscape(log.status || "unknown")}</strong>`))
 										})
 									})
 								})
@@ -293,8 +293,6 @@ module.exports = (_ => {
 			onStart () {
 				this.currentCycleKey = this.getCycleKey(Date.now());
 				this.ensureLogDirectory();
-				this.logQueue = [];
-				this.isWritingLog = false;
 				this.loadCurrentCycleLog();
 				this.startInterval();
 
@@ -929,15 +927,15 @@ module.exports = (_ => {
 				for (let id in observedUsers) userStatusStore[id] = this.getStatusWithMobileAndActivity(id, observedUsers[id], clientStatuses);
 				
 				checkInterval = BDFDB.TimeUtils.interval(_ => {
-					const nowKey = this.getCycleKey(Date.now());
-					if (this.currentCycleKey && this.currentCycleKey !== nowKey) {
-						console.log(`[FriendNotifications] Log cycle rotated from ${this.currentCycleKey} to ${nowKey}`);
-						this.currentCycleKey = nowKey;
-						timeLog = [];
-						if (timeLogList && timeLogList.props) {
-							timeLogList.props.entries = timeLog;
-							BDFDB.ReactUtils.forceUpdate(timeLogList);
+					try {
+						const nowKey = this.getCycleKey(Date.now());
+						if (this.currentCycleKey && this.currentCycleKey !== nowKey) {
+							console.log(`[FriendNotifications] Log cycle rotated from ${this.currentCycleKey} to ${nowKey}`);
+							this.currentCycleKey = nowKey;
+							this.loadCurrentCycleLog();
 						}
+					} catch (cycleErr) {
+						console.error("[FriendNotifications] Cycle rotation check error:", cycleErr);
 					}
 					let amount = this.getOnlineCount();
 					if (friendCounter && friendCounter.props.amount != amount) {
@@ -982,39 +980,27 @@ module.exports = (_ => {
 									.replace(/'{0,1}\$artist'{0,1}|'{0,1}\$custom'{0,1}/g, `<strong>${BDFDB.StringUtils.htmlEscape([status.activity.emoji && status.activity.emoji.name, status.activity.state].filter(n => n).join(" ") || "")}</strong>`);
 							}
 							
-							let desktopString = string.replace(/\$user/g, name).replace(/\$nick/g, nickname ? nickname : !hasUserPlaceholder ? name : "").replace(/\$statusOld/g, oldStatusName).replace(/\$status/g, statusName);
-							if (status.activity) desktopString = desktopString.replace(/\$song|\$game/g, status.activity.name || status.activity.details || "").replace(/\$artist|\$custom/g, [status.activity.emoji && status.activity.emoji.name, status.activity.state].filter(n => n).join(" ") || "");
-							if (status.mobile) desktopString += " (mobile)";
-
 							let statusType = BDFDB.UserUtils.getStatus(user.id);
 							let logEntry = {
 								string: toastString,
 								avatar: avatar,
 								id: id,
 								name: name,
-								username: user.username || name,
-								globalName: user.globalName || user.username || name,
-								nickname: nickname || "",
 								status: statusType,
-								statusName: statusName,
-								oldStatusName: oldStatusName,
-								mobile: !!status.mobile,
-								specialNotice: specialNotice || null,
-								customChanged: !!customChanged,
-								loginNotice: !!loginNotice,
-								activity: status.activity ? {
-									name: status.activity.name,
-									details: status.activity.details,
-									state: status.activity.state,
-									emoji: status.activity.emoji && status.activity.emoji.name ? status.activity.emoji.name : null,
-									type: status.activity.type
-								} : null,
-								message: desktopString,
+								mobile: status.mobile,
 								timestamp: timestamp
 							};
 							if (observedUsers[id].timelog == undefined || observedUsers[id].timelog) {
 								timeLog.unshift(logEntry);
-								this.writeLogToFile(logEntry);
+								if (timeLogList && timeLogList.props) {
+									timeLogList.props.entries = timeLog;
+									BDFDB.ReactUtils.forceUpdate(timeLogList);
+								}
+								try {
+									this.writeLogToFile(logEntry);
+								} catch (logErr) {
+									console.error("[FriendNotifications] writeLogToFile error:", logErr);
+								}
 							}
 							
 							if (!(this.settings.general.muteOnDND && BDFDB.UserUtils.getStatus() == BDFDB.DiscordConstants.StatusTypes.DND) && (!lastTimes[user.id] || lastTimes[user.id] != timestamp)) {
@@ -1034,6 +1020,9 @@ module.exports = (_ => {
 									}
 								};
 								if ((loginNotice ? observedUsers[id].login : observedUsers[id][status.name]) == notificationTypes.DESKTOP.value) {
+									let desktopString = string.replace(/\$user/g, name).replace(/\$nick/g, nickname ? nickname : !hasUserPlaceholder ? name : "").replace(/\$statusOld/g, oldStatusName).replace(/\$status/g, statusName);
+									if (status.activity) desktopString = desktopString.replace(/\$song|\$game/g, status.activity.name || status.activity.details || "").replace(/\$artist|\$custom/g, [status.activity.emoji && status.activity.emoji.name, status.activity.state].filter(n => n).join(" ") || "");
+									if (status.mobile) desktopString += " (mobile)";
 									let notificationSound = this.settings.notificationSounds["desktop" + status.name] || {};
 									BDFDB.NotificationUtils.desktop([desktopString, this.settings.general.showTimeLog && BDFDB.LibraryComponents.DateInput.format(this.settings.dates.logDate, timestamp)].filter(n => n).join("\n\n"), {
 										icon: avatar,
@@ -1254,11 +1243,9 @@ module.exports = (_ => {
 				const mobileTag = entry.mobile ? " 📱" : "";
 
 				const displayName = entry.name || entry.username || "Unknown";
-				const userTag = entry.username && entry.username !== displayName ? ` (@${entry.username})` : (entry.username ? ` (@${entry.username})` : "");
-				const nickTag = entry.nickname && entry.nickname !== displayName ? ` [Nick: ${entry.nickname}]` : "";
-				const userInfo = `${displayName}${userTag}${nickTag} [ID: ${entry.id || "N/A"}]`;
+				const userInfo = `${displayName} [ID: ${entry.id || "N/A"}]`;
 
-				const msg = entry.message || (entry.string ? entry.string.replace(/<[^>]+>/g, "") : `Changed status to '${entry.status || "offline"}'`);
+				const msg = entry.message || (entry.string ? entry.string.replace(/<[^>]+>/g, "") : `${displayName} changed status to '${entry.status || "offline"}'`);
 
 				return `[${dateStr}] ${emoji} [${statusName}]${mobileTag} | ${userInfo} | ${msg}`;
 			}
@@ -1287,7 +1274,7 @@ module.exports = (_ => {
 				const timestamp = new Date(dateStr.replace(/-/g, "/")).getTime() || Date.now();
 				const status = (statusName || "offline").toLowerCase();
 
-				let avatar = this.getUserAvatar(id);
+				let avatar = this.getUserAvatar(id) || "";
 
 				const safeName = (BDFDB.StringUtils && BDFDB.StringUtils.htmlEscape(name)) || name;
 				const safeStatus = (BDFDB.StringUtils && BDFDB.StringUtils.htmlEscape(statusName)) || statusName;
@@ -1298,13 +1285,8 @@ module.exports = (_ => {
 					avatar: avatar,
 					id: id,
 					name: name,
-					username: username || name,
-					globalName: name,
-					nickname: nickname,
 					status: status,
-					statusName: statusName,
 					mobile: isMobile,
-					message: msg,
 					timestamp: timestamp
 				};
 			}
@@ -1312,31 +1294,71 @@ module.exports = (_ => {
 			loadCurrentCycleLog () {
 				try {
 					const fs = require("fs");
-					const jsonFile = (_this || this).getLogFilePath(Date.now(), "json");
-					const textFile = (_this || this).getLogFilePath(Date.now(), "txt");
+					const path = require("path");
+					const dir = (_this || this).getLogDirectory();
+					if (!fs.existsSync(dir)) {
+						fs.mkdirSync(dir, { recursive: true });
+					}
+
+					const now = Date.now();
+					const jsonFile = (_this || this).getLogFilePath(now, "json");
+					const textFile = (_this || this).getLogFilePath(now, "txt");
+					const currentCycle = (_this || this).getCycleKey(now);
 
 					let entries = [];
 
-					// 1. Try reading JSON file first (primary structured source)
+					// 1. Read JSON file for active cycle (NDJSON format)
 					if (fs.existsSync(jsonFile)) {
 						const content = fs.readFileSync(jsonFile, "utf8");
 						if (content && content.trim()) {
 							const lines = content.split(/\r?\n/).filter(l => l && l.trim());
 							for (const line of lines) {
 								try {
-									const parsed = JSON.parse(line);
-									if (parsed && typeof parsed === "object") {
-										if (!parsed.avatar && parsed.id) {
-											parsed.avatar = (_this || this).getUserAvatar(parsed.id);
+									const item = JSON.parse(line);
+									if (item && typeof item === "object") {
+										if (!item.avatar && item.id) {
+											item.avatar = (_this || this).getUserAvatar(item.id);
 										}
-										entries.push(parsed);
+										entries.push(item);
 									}
 								} catch (e) {}
 							}
 						}
 					}
 
-					// 2. Fallback: if JSON file has no entries, read from .txt file and sync to JSON
+					// 2. Recovery: If active cycle JSON is empty, search directory for any logs belonging to this cycle
+					if (!entries.length) {
+						try {
+							const files = fs.readdirSync(dir);
+							for (const file of files) {
+								if (file.startsWith("Log_") && file.endsWith(".json") && file !== (_this || this).getLogFileName(now, "json")) {
+									const fileContent = fs.readFileSync(path.join(dir, file), "utf8");
+									if (fileContent && fileContent.trim()) {
+										const lines = fileContent.split(/\r?\n/).filter(l => l && l.trim());
+										for (const line of lines) {
+											try {
+												const item = JSON.parse(line);
+												if (item && item.timestamp && (_this || this).getCycleKey(item.timestamp) === currentCycle) {
+													if (!item.avatar && item.id) item.avatar = (_this || this).getUserAvatar(item.id);
+													entries.push(item);
+												}
+											} catch (e) {}
+										}
+									}
+								}
+							}
+							if (entries.length) {
+								const jsonLines = entries.map(e => JSON.stringify(e)).join("\n") + "\n";
+								fs.writeFileSync(jsonFile, jsonLines, "utf8");
+								const textLines = entries.map(e => (_this || this).formatLogEntryText(e)).join("\n") + "\n";
+								fs.writeFileSync(textFile, textLines, "utf8");
+							}
+						} catch (recoverErr) {
+							console.error("[FriendNotifications] Error recovering cycle logs:", recoverErr);
+						}
+					}
+
+					// 3. Fallback to parsing text file if still empty
 					if (!entries.length && fs.existsSync(textFile)) {
 						const content = fs.readFileSync(textFile, "utf8");
 						if (content && content.trim()) {
@@ -1354,7 +1376,6 @@ module.exports = (_ => {
 								try {
 									const jsonLines = entries.map(e => JSON.stringify(e)).join("\n") + "\n";
 									fs.writeFileSync(jsonFile, jsonLines, "utf8");
-									console.log(`[FriendNotifications] Populated JSON cycle log from .txt: ${jsonFile}`);
 								} catch (e) {}
 							}
 						}
@@ -1367,7 +1388,7 @@ module.exports = (_ => {
 						timeLogList.props.entries = timeLog;
 						BDFDB.ReactUtils.forceUpdate(timeLogList);
 					}
-					console.log(`[FriendNotifications] Loaded ${timeLog.length} entries into timelog`);
+					console.log(`[FriendNotifications] Loaded ${timeLog.length} entries into timelog for cycle ${currentCycle}`);
 				} catch (e) {
 					console.error("[FriendNotifications] loadCurrentCycleLog error:", e);
 				}
@@ -1395,19 +1416,25 @@ module.exports = (_ => {
 								} else {
 									fs.writeFileSync(currentTextLog, legacyContent, "utf8");
 								}
+								const lines = legacyContent.split(/\r?\n/).filter(l => l && l.trim());
+								const jsonLines = [];
+								for (const line of lines) {
+									const parsed = (_this || this).parseLogLine(line);
+									if (parsed) jsonLines.push(JSON.stringify(parsed));
+								}
+								if (jsonLines.length) {
+									if (fs.existsSync(currentJsonLog)) {
+										fs.appendFileSync(currentJsonLog, jsonLines.join("\n") + "\n", "utf8");
+									} else {
+										fs.writeFileSync(currentJsonLog, jsonLines.join("\n") + "\n", "utf8");
+									}
+								}
 							}
 							fs.renameSync(legacyLog, path.join(dir, "Log.txt.migrated"));
 							console.log("[FriendNotifications] Successfully migrated legacy Log.txt to active cycle file.");
 						} catch (migErr) {
 							console.error("[FriendNotifications] Failed to migrate legacy Log.txt:", migErr);
 						}
-					}
-
-					if (!fs.existsSync(currentTextLog)) {
-						fs.writeFileSync(currentTextLog, "", "utf8");
-					}
-					if (!fs.existsSync(currentJsonLog)) {
-						fs.writeFileSync(currentJsonLog, "", "utf8");
 					}
 				} catch (e) {
 					console.error("[FriendNotifications] Failed to ensure log directory:", e);
@@ -1420,91 +1447,25 @@ module.exports = (_ => {
 					const shouldSave = !settings || !settings.general || settings.general.saveLogToFile !== false;
 					if (!shouldSave) return;
 
-					if (!entry.avatar && entry.id) {
-						entry.avatar = (_this || this).getUserAvatar(entry.id);
+					const fs = require("fs");
+					const dir = (_this || this).getLogDirectory();
+					if (!fs.existsSync(dir)) {
+						fs.mkdirSync(dir, { recursive: true });
 					}
 
-					const jsonLine = JSON.stringify(entry);
-					const textLine = (_this || this).formatLogEntryText(entry);
-					console.log("[FriendNotifications] Appending to cycle log (.json & .txt):", textLine);
-					(_this || this).queueLogWrite({
-						timestamp: (entry && entry.timestamp) || Date.now(),
-						jsonLine: jsonLine,
-						textLine: textLine
-					});
+					const ts = (entry && entry.timestamp) || Date.now();
+					const jsonFile = (_this || this).getLogFilePath(ts, "json");
+					const textFile = (_this || this).getLogFilePath(ts, "txt");
+
+					// 1. JSON persistent log (NDJSON: 1 JSON object per line)
+					const jsonLine = JSON.stringify(entry) + "\n";
+					fs.appendFileSync(jsonFile, jsonLine, "utf8");
+
+					// 2. Human-readable text log with emoji colors
+					const textLine = (_this || this).formatLogEntryText(entry) + "\n";
+					fs.appendFileSync(textFile, textLine, "utf8");
 				} catch (e) {
 					console.error("[FriendNotifications] writeLogToFile error:", e);
-				}
-			}
-
-			queueLogWrite (item) {
-				if (!this.logQueue) this.logQueue = [];
-				this.logQueue.push(item);
-
-				if (this.isWritingLog) return;
-				this.flushLogQueue();
-			}
-
-			flushLogQueue () {
-				if (!this.logQueue || !this.logQueue.length) return;
-				this.isWritingLog = true;
-
-				const queuedItems = this.logQueue;
-				this.logQueue = [];
-
-				const fs = require("fs");
-				const path = require("path");
-				const logDir = (_this || this).getLogDirectory();
-
-				const jsonGroups = {};
-				const textGroups = {};
-
-				for (const item of queuedItems) {
-					const jsonFile = (_this || this).getLogFilePath(item.timestamp, "json");
-					const textFile = (_this || this).getLogFilePath(item.timestamp, "txt");
-
-					if (!jsonGroups[jsonFile]) jsonGroups[jsonFile] = [];
-					if (!textGroups[textFile]) textGroups[textFile] = [];
-
-					jsonGroups[jsonFile].push(item.jsonLine);
-					textGroups[textFile].push(item.textLine);
-				}
-
-				try {
-					if (!fs.existsSync(logDir)) {
-						fs.mkdirSync(logDir, { recursive: true });
-					}
-
-					const writes = [];
-					for (const file in jsonGroups) {
-						writes.push({ file, content: jsonGroups[file].join("\n") + "\n" });
-					}
-					for (const file in textGroups) {
-						writes.push({ file, content: textGroups[file].join("\n") + "\n" });
-					}
-
-					let pending = writes.length;
-					const checkDone = () => {
-						pending--;
-						if (pending <= 0) {
-							this.isWritingLog = false;
-							if (this.logQueue && this.logQueue.length > 0) {
-								this.flushLogQueue();
-							}
-						}
-					};
-
-					for (const writeItem of writes) {
-						fs.appendFile(writeItem.file, writeItem.content, "utf8", err => {
-							if (err) {
-								console.error(`[FriendNotifications] Failed to write to ${writeItem.file}:`, err);
-							}
-							checkDone();
-						});
-					}
-				} catch (err) {
-					this.isWritingLog = false;
-					console.error("[FriendNotifications] flushLogQueue error:", err);
 				}
 			}
 
@@ -1876,7 +1837,7 @@ module.exports = (_ => {
 			}
 
 			generateCsvContent (entries) {
-				const headers = ["Timestamp", "Date & Time", "Status", "Emoji", "Mobile", "Display Name", "Username", "Nickname", "User ID", "Details"];
+				const headers = ["Timestamp", "Date & Time", "Status", "Emoji", "Mobile", "User", "User ID", "Details"];
 				const escapeCsv = val => {
 					let str = String(val ?? "");
 					if (str.includes(",") || str.includes('"') || str.includes("\n") || str.includes("\r")) {
@@ -1886,16 +1847,14 @@ module.exports = (_ => {
 				};
 
 				const rows = entries.map(e => [
-					e.timestamp,
+					e.timestamp ?? "",
 					this.formatLogDate(e.timestamp),
-					(e.statusName || e.status || "").toUpperCase(),
-					this.getStatusEmoji(e.status, e.mobile, e.specialNotice),
-					e.mobile ? "true" : "false",
-					e.name || "",
-					e.username || "",
-					e.nickname || "",
+					(e.status || "").toUpperCase(),
+					this.getStatusEmoji(e.status, e.mobile),
+					e.mobile ? "Yes" : "No",
+					e.name || "Unknown",
 					e.id || "",
-					e.message || (e.string ? e.string.replace(/<[^>]+>/g, "") : "")
+					e.string ? e.string.replace(/<[^>]+>/g, "") : ""
 				]);
 
 				const csvLines = [headers.map(escapeCsv).join(",")];
@@ -1922,6 +1881,7 @@ module.exports = (_ => {
 				const escapeMd = val => String(val ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 				const header = [
 					"# 📋 FriendNotifications — Timelog Export\n",
+					`- **Cycle:** \`${this.getCycleDisplayName()}\``,
 					`- **Exported At:** \`${this.formatLogDate(Date.now())}\``,
 					`- **Total Records:** \`${entries.length}\`\n`,
 					"| Date & Time | Status | User | User ID | Mobile | Details |",
@@ -1930,12 +1890,12 @@ module.exports = (_ => {
 
 				const rows = entries.map(e => {
 					const date = this.formatLogDate(e.timestamp);
-					const emoji = this.getStatusEmoji(e.status, e.mobile, e.specialNotice);
-					const status = `${emoji} ${(e.statusName || e.status || "").toUpperCase()}`;
-					const user = escapeMd(e.name || e.username || "Unknown") + (e.username && e.username !== e.name ? ` (@${escapeMd(e.username)})` : "");
+					const emoji = this.getStatusEmoji(e.status, e.mobile);
+					const status = `${emoji} ${(e.status || "").toUpperCase()}`;
+					const user = escapeMd(e.name || "Unknown");
 					const id = `\`${e.id || ""}\``;
 					const mobile = e.mobile ? "📱 Yes" : "—";
-					const details = escapeMd(e.message || (e.string ? e.string.replace(/<[^>]+>/g, "") : ""));
+					const details = escapeMd(e.string ? e.string.replace(/<[^>]+>/g, "") : "");
 					return `| ${date} | ${status} | ${user} | ${id} | ${mobile} | ${details} |`;
 				});
 
@@ -2035,18 +1995,16 @@ module.exports = (_ => {
 					return letter;
 				};
 
-				const headers = ["Timestamp", "Date & Time", "Status", "Emoji", "Mobile", "Display Name", "Username", "Nickname", "User ID", "Details"];
+				const headers = ["Timestamp", "Date & Time", "Status", "Emoji", "Mobile", "User", "User ID", "Details"];
 				const rows = entries.map(e => [
 					e.timestamp ? String(e.timestamp) : "",
 					this.formatLogDate(e.timestamp),
-					(e.statusName || e.status || "").toUpperCase(),
-					this.getStatusEmoji(e.status, e.mobile, e.specialNotice),
+					(e.status || "").toUpperCase(),
+					this.getStatusEmoji(e.status, e.mobile),
 					e.mobile ? "Yes" : "No",
 					e.name || "",
-					e.username || "",
-					e.nickname || "",
 					e.id || "",
-					e.message || (e.string ? e.string.replace(/<[^>]+>/g, "") : "")
+					e.string ? e.string.replace(/<[^>]+>/g, "") : ""
 				]);
 
 				let sheetDataXml = "<sheetData>";

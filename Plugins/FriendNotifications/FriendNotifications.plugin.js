@@ -218,10 +218,13 @@ module.exports = (_ => {
 						showTimestamp:			{value: false, 			description: "Adds the Timestamp"},
 						muteOnDND:			{value: false, 			description: "Does not notify you when you are in DnD Status"},
 						openOnClick:			{value: false, 			description: "Opens the DM when you click a Notification"},
-						saveLogToFile:			{value: true, 			description: "Save Timelog persistently to local file (~/Documents/BetterDiscord/FriendNotifications/Log.txt)"}
+						saveLogToFile:			{value: true, 			description: "Save Timelog persistently to local rotated cycle file (~/Documents/BetterDiscord/FriendNotifications/Log_<Cycle>.txt)"}
 					},
 					choices: {
 						toastPosition:			{value: "right",		description: "Position of Toast Notifications",		items: "ToastPositions"}
+					},
+					cycles: {
+						logCycle:			{value: "daily",		description: "Log File Cycle / Rotation Interval"}
 					},
 					notificationStrings: {
 						online: 			{value: "$user changed status to '$status'"},
@@ -288,9 +291,11 @@ module.exports = (_ => {
 			}
 			
 			onStart () {
+				this.currentCycleKey = this.getCycleKey(Date.now());
 				this.ensureLogDirectory();
 				this.logQueue = [];
 				this.isWritingLog = false;
+				this.loadCurrentCycleLog();
 				this.startInterval();
 
 				this.forceUpdateAll();
@@ -793,6 +798,28 @@ module.exports = (_ => {
 									]
 								}),
 								BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsItem, {
+									type: "Select",
+									label: "Log File Cycle / Rotation",
+									note: "Rotate log file every 24 hours (Daily), 7 days (Weekly), or 1 month (Monthly) to keep pagination lightweight.",
+									basis: "50%",
+									value: this.getLogCycle(),
+									options: [
+										{ value: "daily", label: "Daily (24 Hours) — Default [Log_YYYY-MM-DD.txt]" },
+										{ value: "weekly", label: "Weekly (7 Days) [Log_YYYY-Wxx.txt]" },
+										{ value: "monthly", label: "Monthly (Max 30 Days) [Log_YYYY-MM.txt]" }
+									],
+									onChange: value => {
+										if (!this.settings.cycles) this.settings.cycles = {};
+										this.settings.cycles.logCycle = value;
+										BDFDB.DataUtils.save(this.settings.cycles, this, "cycles");
+										this.SettingsUpdated = true;
+										this.currentCycleKey = this.getCycleKey(Date.now());
+										this.ensureLogDirectory();
+										this.loadCurrentCycleLog();
+										BDFDB.PluginUtils.refreshSettingsPanel(this, settingsPanel, collapseStates);
+									}
+								}),
+								BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsItem, {
 									type: "Button",
 									label: "Overview of LogIns/-Outs of current Session",
 									onClick: _ => this.showTimeLog(),
@@ -902,6 +929,16 @@ module.exports = (_ => {
 				for (let id in observedUsers) userStatusStore[id] = this.getStatusWithMobileAndActivity(id, observedUsers[id], clientStatuses);
 				
 				checkInterval = BDFDB.TimeUtils.interval(_ => {
+					const nowKey = this.getCycleKey(Date.now());
+					if (this.currentCycleKey && this.currentCycleKey !== nowKey) {
+						console.log(`[FriendNotifications] Log cycle rotated from ${this.currentCycleKey} to ${nowKey}`);
+						this.currentCycleKey = nowKey;
+						timeLog = [];
+						if (timeLogList && timeLogList.props) {
+							timeLogList.props.entries = timeLog;
+							BDFDB.ReactUtils.forceUpdate(timeLogList);
+						}
+					}
 					let amount = this.getOnlineCount();
 					if (friendCounter && friendCounter.props.amount != amount) {
 						friendCounter.props.amount = amount;
@@ -1055,10 +1092,12 @@ module.exports = (_ => {
 
 			showTimeLog () {
 				let searchTimeout;
+				const cycleName = (_this || this).getLogCycleName();
+				const cycleFileName = (_this || this).getLogFileName(Date.now());
 				BDFDB.ModalUtils.open(this, {
 					size: "MEDIUM",
 					header: "LogIn/-Out Timelog",
-					subHeader: "",
+					subHeader: `Cycle: ${cycleName} (${cycleFileName})`,
 					className: BDFDB.disCN._friendnotificationstimelogmodal,
 					titleChildren: [
 						BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Button, {
@@ -1130,6 +1169,49 @@ module.exports = (_ => {
 				return this.getDefaultLogDirectory();
 			}
 
+			getLogCycle () {
+				return (this.settings && this.settings.cycles && this.settings.cycles.logCycle) || "daily";
+			}
+
+			getLogCycleName () {
+				const cycle = this.getLogCycle();
+				switch (cycle) {
+					case "weekly": return "Weekly";
+					case "monthly": return "Monthly";
+					case "daily":
+					default: return "Daily";
+				}
+			}
+
+			getCycleKey (timestamp) {
+				const d = new Date(timestamp || Date.now());
+				const cycle = this.getLogCycle();
+				const pad = n => String(n).padStart(2, "0");
+
+				if (cycle === "weekly") {
+					const target = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+					const dayNr = target.getUTCDay() || 7;
+					target.setUTCDate(target.getUTCDate() + 4 - dayNr);
+					const yearStart = new Date(Date.UTC(target.getUTCFullYear(), 0, 1));
+					const weekNo = Math.ceil((((target - yearStart) / 86400000) + 1) / 7);
+					return `${target.getUTCFullYear()}-W${pad(weekNo)}`;
+				} else if (cycle === "monthly") {
+					return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+				} else {
+					// daily
+					return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+				}
+			}
+
+			getLogFileName (timestamp) {
+				return `Log_${this.getCycleKey(timestamp)}.txt`;
+			}
+
+			getLogFilePath (timestamp) {
+				const path = require("path");
+				return path.join(this.getLogDirectory(), this.getLogFileName(timestamp));
+			}
+
 			formatLogDate (timestamp) {
 				const d = new Date(timestamp || Date.now());
 				const pad = n => String(n).padStart(2, "0");
@@ -1168,6 +1250,92 @@ module.exports = (_ => {
 				return `[${dateStr}] ${emoji} [${statusName}]${mobileTag} | ${userInfo} | ${msg}`;
 			}
 
+			parseLogLine (line) {
+				if (!line || typeof line !== "string" || !line.trim()) return null;
+				const match = line.match(/^\[(.*?)\]\s+(?:(\S+)\s+)?\[(.*?)\](?:\s+(📱))?\s+\|\s+(.*?)\s+\|\s+(.*)$/);
+				if (!match) return null;
+
+				const [, dateStr, emoji, statusName, mobileTag, userInfo, msg] = match;
+				const isMobile = !!mobileTag;
+
+				let id = "N/A";
+				const idMatch = userInfo.match(/\[ID:\s*([^\]]+)\]/);
+				if (idMatch) id = idMatch[1].trim();
+
+				let username = "";
+				const userMatch = userInfo.match(/\(@([^)]+)\)/);
+				if (userMatch) username = userMatch[1].trim();
+
+				let nickname = "";
+				const nickMatch = userInfo.match(/\[Nick:\s*([^\]]+)\]/);
+				if (nickMatch) nickname = nickMatch[1].trim();
+
+				const name = userInfo.replace(/\s*(\(@|\[Nick:|\[ID:).*$/, "").trim() || username || "Unknown";
+				const timestamp = new Date(dateStr.replace(/-/g, "/")).getTime() || Date.now();
+				const status = (statusName || "offline").toLowerCase();
+
+				let avatar = null;
+				try {
+					if (id && id !== "N/A" && window.BDFDB && BDFDB.LibraryStores && BDFDB.LibraryStores.UserStore) {
+						const u = BDFDB.LibraryStores.UserStore.getUser(id);
+						if (u) avatar = BDFDB.UserUtils.getAvatar(u.id);
+					}
+				} catch (e) {}
+
+				return {
+					string: msg,
+					avatar: avatar,
+					id: id,
+					name: name,
+					username: username || name,
+					globalName: name,
+					nickname: nickname,
+					status: status,
+					statusName: statusName,
+					mobile: isMobile,
+					message: msg,
+					timestamp: timestamp
+				};
+			}
+
+			loadCurrentCycleLog () {
+				try {
+					const fs = require("fs");
+					const currentLog = (_this || this).getLogFilePath(Date.now());
+					if (!fs.existsSync(currentLog)) {
+						timeLog = [];
+						return;
+					}
+
+					const content = fs.readFileSync(currentLog, "utf8");
+					if (!content || !content.trim()) {
+						timeLog = [];
+						return;
+					}
+
+					const lines = content.split(/\r?\n/).filter(l => l && l.trim());
+					const parsedEntries = [];
+
+					for (const line of lines) {
+						const entry = (_this || this).parseLogLine(line);
+						if (entry) {
+							parsedEntries.push(entry);
+						}
+					}
+
+					parsedEntries.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+					timeLog = parsedEntries;
+					if (timeLogList && timeLogList.props) {
+						timeLogList.props.entries = timeLog;
+						BDFDB.ReactUtils.forceUpdate(timeLogList);
+					}
+					console.log(`[FriendNotifications] Loaded ${timeLog.length} entries from active cycle log: ${currentLog}`);
+				} catch (e) {
+					console.error("[FriendNotifications] loadCurrentCycleLog error:", e);
+				}
+			}
+
 			ensureLogDirectory () {
 				try {
 					const fs = require("fs");
@@ -1176,9 +1344,29 @@ module.exports = (_ => {
 					if (!fs.existsSync(dir)) {
 						fs.mkdirSync(dir, { recursive: true });
 					}
-					const logFile = path.join(dir, "Log.txt");
-					if (!fs.existsSync(logFile)) {
-						fs.writeFileSync(logFile, "", "utf8");
+
+					const legacyLog = path.join(dir, "Log.txt");
+					const currentLog = (_this || this).getLogFilePath(Date.now());
+
+					if (fs.existsSync(legacyLog)) {
+						try {
+							const legacyContent = fs.readFileSync(legacyLog, "utf8");
+							if (legacyContent && legacyContent.trim()) {
+								if (fs.existsSync(currentLog)) {
+									fs.appendFileSync(currentLog, (legacyContent.endsWith("\n") ? legacyContent : legacyContent + "\n"), "utf8");
+								} else {
+									fs.writeFileSync(currentLog, legacyContent, "utf8");
+								}
+							}
+							fs.renameSync(legacyLog, path.join(dir, "Log.txt.migrated"));
+							console.log("[FriendNotifications] Successfully migrated legacy Log.txt to active cycle file.");
+						} catch (migErr) {
+							console.error("[FriendNotifications] Failed to migrate legacy Log.txt:", migErr);
+						}
+					}
+
+					if (!fs.existsSync(currentLog)) {
+						fs.writeFileSync(currentLog, "", "utf8");
 					}
 				} catch (e) {
 					console.error("[FriendNotifications] Failed to ensure log directory:", e);
@@ -1191,16 +1379,16 @@ module.exports = (_ => {
 					const shouldSave = !settings || !settings.general || settings.general.saveLogToFile !== false;
 					if (!shouldSave) return;
 					const line = (_this || this).formatLogEntryText(entry);
-					console.log("[FriendNotifications] Appending to Log.txt:", line);
-					(_this || this).queueLogWrite(line);
+					console.log("[FriendNotifications] Appending to cycle log file:", line);
+					(_this || this).queueLogWrite(line, (entry && entry.timestamp) || Date.now());
 				} catch (e) {
 					console.error("[FriendNotifications] writeLogToFile error:", e);
 				}
 			}
 
-			queueLogWrite (line) {
+			queueLogWrite (line, timestamp = Date.now()) {
 				if (!this.logQueue) this.logQueue = [];
-				this.logQueue.push(line);
+				this.logQueue.push({ line, timestamp });
 
 				if (this.isWritingLog) return;
 				this.flushLogQueue();
@@ -1210,29 +1398,49 @@ module.exports = (_ => {
 				if (!this.logQueue || !this.logQueue.length) return;
 				this.isWritingLog = true;
 
-				const linesToWrite = this.logQueue.join("\n") + "\n";
+				const queuedItems = this.logQueue;
 				this.logQueue = [];
 
 				const fs = require("fs");
 				const path = require("path");
 				const logDir = (_this || this).getLogDirectory();
-				const logFile = path.join(logDir, "Log.txt");
+
+				const grouped = {};
+				for (const item of queuedItems) {
+					const targetFile = (_this || this).getLogFilePath(item.timestamp);
+					if (!grouped[targetFile]) grouped[targetFile] = [];
+					grouped[targetFile].push(item.line);
+				}
 
 				try {
 					if (!fs.existsSync(logDir)) {
 						fs.mkdirSync(logDir, { recursive: true });
 					}
-					fs.appendFile(logFile, linesToWrite, "utf8", err => {
-						this.isWritingLog = false;
-						if (err) {
-							console.error("[FriendNotifications] Failed to write to Log.txt:", err);
-						} else {
-							console.log("[FriendNotifications] Successfully wrote to Log.txt:", logFile);
+
+					const filePaths = Object.keys(grouped);
+					let pending = filePaths.length;
+
+					const checkDone = () => {
+						pending--;
+						if (pending <= 0) {
+							this.isWritingLog = false;
+							if (this.logQueue && this.logQueue.length > 0) {
+								this.flushLogQueue();
+							}
 						}
-						if (this.logQueue && this.logQueue.length > 0) {
-							this.flushLogQueue();
-						}
-					});
+					};
+
+					for (const targetFile of filePaths) {
+						const linesToWrite = grouped[targetFile].join("\n") + "\n";
+						fs.appendFile(targetFile, linesToWrite, "utf8", err => {
+							if (err) {
+								console.error(`[FriendNotifications] Failed to write to ${targetFile}:`, err);
+							} else {
+								console.log(`[FriendNotifications] Successfully wrote to ${targetFile}`);
+							}
+							checkDone();
+						});
+					}
 				} catch (err) {
 					this.isWritingLog = false;
 					console.error("[FriendNotifications] flushLogQueue error:", err);
@@ -1484,10 +1692,13 @@ module.exports = (_ => {
 					{ value: "md", label: "📝 Markdown Document (.md)" }
 				];
 
+				const cycleName = (_this || this).getLogCycleName();
+				const cycleKey = (_this || this).getCycleKey(Date.now());
+
 				BDFDB.ModalUtils.open(this, {
 					size: "SMALL",
 					header: "Export Timelog",
-					subHeader: `Export ${entriesToExport.length} log ${entriesToExport.length === 1 ? "entry" : "entries"}`,
+					subHeader: `Export ${entriesToExport.length} log ${entriesToExport.length === 1 ? "entry" : "entries"} (${cycleName}: ${cycleKey})`,
 					buttons: [
 						{
 							contents: "Cancel",
@@ -1546,8 +1757,9 @@ module.exports = (_ => {
 				format = (format || "txt").toLowerCase();
 				const now = new Date();
 				const pad = n => String(n).padStart(2, "0");
-				const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-				const defaultName = `Timelog_${dateStr}.${format}`;
+				const cycleKey = (_this || this).getCycleKey(now);
+				const timeSuffix = `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+				const defaultName = `Timelog_${cycleKey}_${timeSuffix}.${format}`;
 
 				const targetPath = await this.promptSaveFile(defaultName, format);
 				if (!targetPath) return;

@@ -181,7 +181,7 @@ module.exports = (_ => {
 								}),
 								BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Avatars.Avatar, {
 									className: BDFDB.disCN._friendnotificationslogavatar,
-									src: log.avatar,
+									src: log.avatar || (_this && _this.getUserAvatar && _this.getUserAvatar(log.id)) || (log.id && BDFDB.UserUtils && BDFDB.UserUtils.getAvatar(log.id)),
 									size: BDFDB.LibraryComponents.AvatarConstants.AvatarSizes.SIZE_40
 								}),
 								_this.createStatusDot(log.status, log.mobile, {marginRight: 6}),
@@ -1203,13 +1203,26 @@ module.exports = (_ => {
 				}
 			}
 
-			getLogFileName (timestamp) {
-				return `Log_${this.getCycleKey(timestamp)}.txt`;
+			getLogFileName (timestamp, ext = "json") {
+				return `Log_${this.getCycleKey(timestamp)}.${ext}`;
 			}
 
-			getLogFilePath (timestamp) {
+			getLogFilePath (timestamp, ext = "json") {
 				const path = require("path");
-				return path.join(this.getLogDirectory(), this.getLogFileName(timestamp));
+				return path.join(this.getLogDirectory(), this.getLogFileName(timestamp, ext));
+			}
+
+			getUserAvatar (id) {
+				if (!id || id === "N/A") return null;
+				try {
+					let EUdata = BDFDB.BDUtils.isPluginEnabled("EditUsers") && BDFDB.DataUtils.load("EditUsers", "users", id) || {};
+					if (EUdata.removeIcon) return "";
+					if (EUdata.url) return EUdata.url;
+					if (BDFDB.UserUtils && typeof BDFDB.UserUtils.getAvatar == "function") {
+						return BDFDB.UserUtils.getAvatar(id);
+					}
+				} catch (e) {}
+				return null;
 			}
 
 			formatLogDate (timestamp) {
@@ -1274,16 +1287,14 @@ module.exports = (_ => {
 				const timestamp = new Date(dateStr.replace(/-/g, "/")).getTime() || Date.now();
 				const status = (statusName || "offline").toLowerCase();
 
-				let avatar = null;
-				try {
-					if (id && id !== "N/A" && window.BDFDB && BDFDB.LibraryStores && BDFDB.LibraryStores.UserStore) {
-						const u = BDFDB.LibraryStores.UserStore.getUser(id);
-						if (u) avatar = BDFDB.UserUtils.getAvatar(u.id);
-					}
-				} catch (e) {}
+				let avatar = this.getUserAvatar(id);
+
+				const safeName = (BDFDB.StringUtils && BDFDB.StringUtils.htmlEscape(name)) || name;
+				const safeStatus = (BDFDB.StringUtils && BDFDB.StringUtils.htmlEscape(statusName)) || statusName;
+				const richString = `<strong>${safeName}</strong> changed status to '<strong>${safeStatus}</strong>'`;
 
 				return {
-					string: msg,
+					string: richString,
 					avatar: avatar,
 					id: id,
 					name: name,
@@ -1301,36 +1312,62 @@ module.exports = (_ => {
 			loadCurrentCycleLog () {
 				try {
 					const fs = require("fs");
-					const currentLog = (_this || this).getLogFilePath(Date.now());
-					if (!fs.existsSync(currentLog)) {
-						timeLog = [];
-						return;
-					}
+					const jsonFile = (_this || this).getLogFilePath(Date.now(), "json");
+					const textFile = (_this || this).getLogFilePath(Date.now(), "txt");
 
-					const content = fs.readFileSync(currentLog, "utf8");
-					if (!content || !content.trim()) {
-						timeLog = [];
-						return;
-					}
+					let entries = [];
 
-					const lines = content.split(/\r?\n/).filter(l => l && l.trim());
-					const parsedEntries = [];
-
-					for (const line of lines) {
-						const entry = (_this || this).parseLogLine(line);
-						if (entry) {
-							parsedEntries.push(entry);
+					// 1. Try reading JSON file first (primary structured source)
+					if (fs.existsSync(jsonFile)) {
+						const content = fs.readFileSync(jsonFile, "utf8");
+						if (content && content.trim()) {
+							const lines = content.split(/\r?\n/).filter(l => l && l.trim());
+							for (const line of lines) {
+								try {
+									const parsed = JSON.parse(line);
+									if (parsed && typeof parsed === "object") {
+										if (!parsed.avatar && parsed.id) {
+											parsed.avatar = (_this || this).getUserAvatar(parsed.id);
+										}
+										entries.push(parsed);
+									}
+								} catch (e) {}
+							}
 						}
 					}
 
-					parsedEntries.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+					// 2. Fallback: if JSON file has no entries, read from .txt file and sync to JSON
+					if (!entries.length && fs.existsSync(textFile)) {
+						const content = fs.readFileSync(textFile, "utf8");
+						if (content && content.trim()) {
+							const lines = content.split(/\r?\n/).filter(l => l && l.trim());
+							for (const line of lines) {
+								const parsed = (_this || this).parseLogLine(line);
+								if (parsed) {
+									if (!parsed.avatar && parsed.id) {
+										parsed.avatar = (_this || this).getUserAvatar(parsed.id);
+									}
+									entries.push(parsed);
+								}
+							}
+							if (entries.length) {
+								try {
+									const jsonLines = entries.map(e => JSON.stringify(e)).join("\n") + "\n";
+									fs.writeFileSync(jsonFile, jsonLines, "utf8");
+									console.log(`[FriendNotifications] Populated JSON cycle log from .txt: ${jsonFile}`);
+								} catch (e) {}
+							}
+						}
+					}
 
-					timeLog = parsedEntries;
+					entries.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+					timeLog = entries;
 					if (timeLogList && timeLogList.props) {
 						timeLogList.props.entries = timeLog;
 						BDFDB.ReactUtils.forceUpdate(timeLogList);
 					}
-					console.log(`[FriendNotifications] Loaded ${timeLog.length} entries from active cycle log: ${currentLog}`);
+					console.log(`[FriendNotifications] Loaded ${timeLog.length} entries into timelog`);
 				} catch (e) {
 					console.error("[FriendNotifications] loadCurrentCycleLog error:", e);
 				}
@@ -1346,16 +1383,17 @@ module.exports = (_ => {
 					}
 
 					const legacyLog = path.join(dir, "Log.txt");
-					const currentLog = (_this || this).getLogFilePath(Date.now());
+					const currentTextLog = (_this || this).getLogFilePath(Date.now(), "txt");
+					const currentJsonLog = (_this || this).getLogFilePath(Date.now(), "json");
 
 					if (fs.existsSync(legacyLog)) {
 						try {
 							const legacyContent = fs.readFileSync(legacyLog, "utf8");
 							if (legacyContent && legacyContent.trim()) {
-								if (fs.existsSync(currentLog)) {
-									fs.appendFileSync(currentLog, (legacyContent.endsWith("\n") ? legacyContent : legacyContent + "\n"), "utf8");
+								if (fs.existsSync(currentTextLog)) {
+									fs.appendFileSync(currentTextLog, (legacyContent.endsWith("\n") ? legacyContent : legacyContent + "\n"), "utf8");
 								} else {
-									fs.writeFileSync(currentLog, legacyContent, "utf8");
+									fs.writeFileSync(currentTextLog, legacyContent, "utf8");
 								}
 							}
 							fs.renameSync(legacyLog, path.join(dir, "Log.txt.migrated"));
@@ -1365,8 +1403,11 @@ module.exports = (_ => {
 						}
 					}
 
-					if (!fs.existsSync(currentLog)) {
-						fs.writeFileSync(currentLog, "", "utf8");
+					if (!fs.existsSync(currentTextLog)) {
+						fs.writeFileSync(currentTextLog, "", "utf8");
+					}
+					if (!fs.existsSync(currentJsonLog)) {
+						fs.writeFileSync(currentJsonLog, "", "utf8");
 					}
 				} catch (e) {
 					console.error("[FriendNotifications] Failed to ensure log directory:", e);
@@ -1378,17 +1419,27 @@ module.exports = (_ => {
 					const settings = (_this && _this.settings) || this.settings;
 					const shouldSave = !settings || !settings.general || settings.general.saveLogToFile !== false;
 					if (!shouldSave) return;
-					const line = (_this || this).formatLogEntryText(entry);
-					console.log("[FriendNotifications] Appending to cycle log file:", line);
-					(_this || this).queueLogWrite(line, (entry && entry.timestamp) || Date.now());
+
+					if (!entry.avatar && entry.id) {
+						entry.avatar = (_this || this).getUserAvatar(entry.id);
+					}
+
+					const jsonLine = JSON.stringify(entry);
+					const textLine = (_this || this).formatLogEntryText(entry);
+					console.log("[FriendNotifications] Appending to cycle log (.json & .txt):", textLine);
+					(_this || this).queueLogWrite({
+						timestamp: (entry && entry.timestamp) || Date.now(),
+						jsonLine: jsonLine,
+						textLine: textLine
+					});
 				} catch (e) {
 					console.error("[FriendNotifications] writeLogToFile error:", e);
 				}
 			}
 
-			queueLogWrite (line, timestamp = Date.now()) {
+			queueLogWrite (item) {
 				if (!this.logQueue) this.logQueue = [];
-				this.logQueue.push({ line, timestamp });
+				this.logQueue.push(item);
 
 				if (this.isWritingLog) return;
 				this.flushLogQueue();
@@ -1405,11 +1456,18 @@ module.exports = (_ => {
 				const path = require("path");
 				const logDir = (_this || this).getLogDirectory();
 
-				const grouped = {};
+				const jsonGroups = {};
+				const textGroups = {};
+
 				for (const item of queuedItems) {
-					const targetFile = (_this || this).getLogFilePath(item.timestamp);
-					if (!grouped[targetFile]) grouped[targetFile] = [];
-					grouped[targetFile].push(item.line);
+					const jsonFile = (_this || this).getLogFilePath(item.timestamp, "json");
+					const textFile = (_this || this).getLogFilePath(item.timestamp, "txt");
+
+					if (!jsonGroups[jsonFile]) jsonGroups[jsonFile] = [];
+					if (!textGroups[textFile]) textGroups[textFile] = [];
+
+					jsonGroups[jsonFile].push(item.jsonLine);
+					textGroups[textFile].push(item.textLine);
 				}
 
 				try {
@@ -1417,9 +1475,15 @@ module.exports = (_ => {
 						fs.mkdirSync(logDir, { recursive: true });
 					}
 
-					const filePaths = Object.keys(grouped);
-					let pending = filePaths.length;
+					const writes = [];
+					for (const file in jsonGroups) {
+						writes.push({ file, content: jsonGroups[file].join("\n") + "\n" });
+					}
+					for (const file in textGroups) {
+						writes.push({ file, content: textGroups[file].join("\n") + "\n" });
+					}
 
+					let pending = writes.length;
 					const checkDone = () => {
 						pending--;
 						if (pending <= 0) {
@@ -1430,13 +1494,10 @@ module.exports = (_ => {
 						}
 					};
 
-					for (const targetFile of filePaths) {
-						const linesToWrite = grouped[targetFile].join("\n") + "\n";
-						fs.appendFile(targetFile, linesToWrite, "utf8", err => {
+					for (const writeItem of writes) {
+						fs.appendFile(writeItem.file, writeItem.content, "utf8", err => {
 							if (err) {
-								console.error(`[FriendNotifications] Failed to write to ${targetFile}:`, err);
-							} else {
-								console.log(`[FriendNotifications] Successfully wrote to ${targetFile}`);
+								console.error(`[FriendNotifications] Failed to write to ${writeItem.file}:`, err);
 							}
 							checkDone();
 						});
@@ -1535,6 +1596,7 @@ module.exports = (_ => {
 
 				const extFilters = {
 					txt: [{ name: "Text Document (*.txt)", extensions: ["txt"] }, { name: "All Files (*.*)", extensions: ["*"] }],
+					json: [{ name: "JSON Document (*.json)", extensions: ["json"] }, { name: "All Files (*.*)", extensions: ["*"] }],
 					xlsx: [{ name: "Excel Spreadsheet (*.xlsx)", extensions: ["xlsx"] }, { name: "All Files (*.*)", extensions: ["*"] }],
 					csv: [{ name: "CSV Spreadsheet (*.csv)", extensions: ["csv"] }, { name: "All Files (*.*)", extensions: ["*"] }],
 					md: [{ name: "Markdown Document (*.md)", extensions: ["md"] }, { name: "All Files (*.*)", extensions: ["*"] }]
@@ -1597,6 +1659,12 @@ module.exports = (_ => {
 					},
 					{
 						type: "item",
+						id: "export-json",
+						label: "JSON Document (.json)",
+						action: () => this.handleExportWithSaveDialog("json", currentEntries)
+					},
+					{
+						type: "item",
 						id: "export-xlsx",
 						label: "Excel Spreadsheet (.xlsx)",
 						action: () => this.handleExportWithSaveDialog("xlsx", currentEntries)
@@ -1646,6 +1714,11 @@ module.exports = (_ => {
 										action: () => this.handleExportWithSaveDialog("txt", currentEntries)
 									}),
 									BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
+										label: "JSON Document (.json)",
+										id: BDFDB.ContextMenuUtils.createItemId(this.name, "export-json"),
+										action: () => this.handleExportWithSaveDialog("json", currentEntries)
+									}),
+									BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
 										label: "Excel Spreadsheet (.xlsx)",
 										id: BDFDB.ContextMenuUtils.createItemId(this.name, "export-xlsx"),
 										action: () => this.handleExportWithSaveDialog("xlsx", currentEntries)
@@ -1687,6 +1760,7 @@ module.exports = (_ => {
 				let selectedFormat = "txt";
 				const formatOptions = [
 					{ value: "txt", label: "📄 Plain Text (.txt) — Default" },
+					{ value: "json", label: "📦 JSON Document (.json)" },
 					{ value: "xlsx", label: "📊 Microsoft Excel (.xlsx)" },
 					{ value: "csv", label: "📑 Comma Separated Values (.csv)" },
 					{ value: "md", label: "📝 Markdown Document (.md)" }
@@ -1772,6 +1846,9 @@ module.exports = (_ => {
 					if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
 
 					switch (format) {
+						case "json":
+							fs.writeFileSync(targetPath, JSON.stringify(entries, null, 2), "utf8");
+							break;
 						case "csv":
 							fs.writeFileSync(targetPath, this.generateCsvContent(entries), "utf8");
 							break;

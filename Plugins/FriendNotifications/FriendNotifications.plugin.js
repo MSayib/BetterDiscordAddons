@@ -217,7 +217,8 @@ module.exports = (_ => {
 						addOnlineCount:			{value: true, 			description: "Adds an Online Friend Counter to the Server List (Click to open Time Log)"},
 						showTimestamp:			{value: false, 			description: "Adds the Timestamp"},
 						muteOnDND:			{value: false, 			description: "Does not notify you when you are in DnD Status"},
-						openOnClick:			{value: false, 			description: "Opens the DM when you click a Notification"}
+						openOnClick:			{value: false, 			description: "Opens the DM when you click a Notification"},
+						saveLogToFile:			{value: true, 			description: "Save Timelog persistently to local file (~/Documents/BetterDiscord/FriendNotifications/Log.txt)"}
 					},
 					choices: {
 						toastPosition:			{value: "right",		description: "Position of Toast Notifications",		items: "ToastPositions"}
@@ -241,6 +242,9 @@ module.exports = (_ => {
 					amounts: {
 						toastTime:			{value: 5, 	min: 1,		description: "Amount of Seconds a Toast Notification stays on Screen: "},
 						checkInterval:			{value: 10, 	min: 5,		description: "Checks Users every X Seconds: "}
+					},
+					paths: {
+						logDirectory:			{value: "", 			description: "Custom Log Directory"}
 					}
 				};
 			
@@ -284,6 +288,9 @@ module.exports = (_ => {
 			}
 			
 			onStart () {
+				this.ensureLogDirectory();
+				this.logQueue = [];
+				this.isWritingLog = false;
 				this.startInterval();
 
 				this.forceUpdateAll();
@@ -724,12 +731,80 @@ module.exports = (_ => {
 						settingsItems.push(BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.CollapseContainer, {
 							title: "LogIn/-Out Timelog",
 							collapseStates: collapseStates,
-							children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsItem, {
-								type: "Button",
-								label: "Overview of LogIns/-Outs of current Session",
-								onClick: _ => this.showTimeLog(),
-								children: "Timelog"
-							})
+							children: [
+								BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Flex, {
+									className: BDFDB.disCN.marginbottom16,
+									direction: BDFDB.LibraryComponents.Flex.Direction.VERTICAL,
+									children: [
+										BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsLabel, {
+											label: "Log Directory:",
+											note: `Current: ${this.getLogDirectory()}`
+										}),
+										BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Flex, {
+											className: BDFDB.disCN.margintop8,
+											align: BDFDB.LibraryComponents.Flex.Align.CENTER,
+											children: [
+												BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Flex.Child, {
+													children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.TextInput, {
+														placeholder: this.getDefaultLogDirectory(),
+														value: (this.settings.paths && this.settings.paths.logDirectory) || "",
+														onChange: value => {
+															if (!this.settings.paths) this.settings.paths = {};
+															this.settings.paths.logDirectory = value.trim();
+															BDFDB.DataUtils.save(this.settings.paths, this, "paths");
+															this.SettingsUpdated = true;
+															this.ensureLogDirectory();
+														}
+													})
+												}),
+												BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Button, {
+													size: BDFDB.LibraryComponents.Button.Sizes.SMALL,
+													style: {marginLeft: 6},
+													children: "Browse...",
+													onClick: async _ => {
+														const chosen = await this.promptChooseFolder();
+														if (chosen) {
+															if (!this.settings.paths) this.settings.paths = {};
+															this.settings.paths.logDirectory = chosen;
+															BDFDB.DataUtils.save(this.settings.paths, this, "paths");
+															this.SettingsUpdated = true;
+															this.ensureLogDirectory();
+															BDFDB.PluginUtils.refreshSettingsPanel(this, settingsPanel, collapseStates);
+														}
+													}
+												}),
+												BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Button, {
+													color: BDFDB.LibraryComponents.Button.Colors.PRIMARY,
+													look: BDFDB.LibraryComponents.Button.Looks.LINK,
+													size: BDFDB.LibraryComponents.Button.Sizes.SMALL,
+													style: {marginLeft: 6},
+													children: "Reset",
+													onClick: _ => {
+														if (!this.settings.paths) this.settings.paths = {};
+														this.settings.paths.logDirectory = "";
+														BDFDB.DataUtils.save(this.settings.paths, this, "paths");
+														this.SettingsUpdated = true;
+														this.ensureLogDirectory();
+														BDFDB.PluginUtils.refreshSettingsPanel(this, settingsPanel, collapseStates);
+													}
+												})
+											]
+										})
+									]
+								}),
+								BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsItem, {
+									type: "Button",
+									label: "Overview of LogIns/-Outs of current Session",
+									onClick: _ => this.showTimeLog(),
+									children: "Timelog"
+								}),
+								BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SettingsItem, {
+									type: "Button",
+									label: "Open Log Directory in File Manager",
+									onClick: _ => (_this || this).openLogDirectory(),
+									children: "Open Folder"
+								})
+							]
 						}));
 						
 						return settingsItems;
@@ -870,16 +945,40 @@ module.exports = (_ => {
 									.replace(/'{0,1}\$artist'{0,1}|'{0,1}\$custom'{0,1}/g, `<strong>${BDFDB.StringUtils.htmlEscape([status.activity.emoji && status.activity.emoji.name, status.activity.state].filter(n => n).join(" ") || "")}</strong>`);
 							}
 							
+							let desktopString = string.replace(/\$user/g, name).replace(/\$nick/g, nickname ? nickname : !hasUserPlaceholder ? name : "").replace(/\$statusOld/g, oldStatusName).replace(/\$status/g, statusName);
+							if (status.activity) desktopString = desktopString.replace(/\$song|\$game/g, status.activity.name || status.activity.details || "").replace(/\$artist|\$custom/g, [status.activity.emoji && status.activity.emoji.name, status.activity.state].filter(n => n).join(" ") || "");
+							if (status.mobile) desktopString += " (mobile)";
+
 							let statusType = BDFDB.UserUtils.getStatus(user.id);
-							if (observedUsers[id].timelog == undefined || observedUsers[id].timelog) timeLog.unshift({
+							let logEntry = {
 								string: toastString,
 								avatar: avatar,
 								id: id,
 								name: name,
+								username: user.username || name,
+								globalName: user.globalName || user.username || name,
+								nickname: nickname || "",
 								status: statusType,
-								mobile: status.mobile,
+								statusName: statusName,
+								oldStatusName: oldStatusName,
+								mobile: !!status.mobile,
+								specialNotice: specialNotice || null,
+								customChanged: !!customChanged,
+								loginNotice: !!loginNotice,
+								activity: status.activity ? {
+									name: status.activity.name,
+									details: status.activity.details,
+									state: status.activity.state,
+									emoji: status.activity.emoji && status.activity.emoji.name ? status.activity.emoji.name : null,
+									type: status.activity.type
+								} : null,
+								message: desktopString,
 								timestamp: timestamp
-							});
+							};
+							if (observedUsers[id].timelog == undefined || observedUsers[id].timelog) {
+								timeLog.unshift(logEntry);
+								this.writeLogToFile(logEntry);
+							}
 							
 							if (!(this.settings.general.muteOnDND && BDFDB.UserUtils.getStatus() == BDFDB.DiscordConstants.StatusTypes.DND) && (!lastTimes[user.id] || lastTimes[user.id] != timestamp)) {
 								lastTimes[user.id] = timestamp;
@@ -898,9 +997,6 @@ module.exports = (_ => {
 									}
 								};
 								if ((loginNotice ? observedUsers[id].login : observedUsers[id][status.name]) == notificationTypes.DESKTOP.value) {
-									let desktopString = string.replace(/\$user/g, name).replace(/\$nick/g, nickname ? nickname : !hasUserPlaceholder ? name : "").replace(/\$statusOld/g, oldStatusName).replace(/\$status/g, statusName);
-									if (status.activity) desktopString = desktopString.replace(/\$song|\$game/g, status.activity.name || status.activity.details || "").replace(/\$artist|\$custom/g, [status.activity.emoji && status.activity.emoji.name, status.activity.state].filter(n => n).join(" ") || "");
-									if (status.mobile) desktopString += " (mobile)";
 									let notificationSound = this.settings.notificationSounds["desktop" + status.name] || {};
 									BDFDB.NotificationUtils.desktop([desktopString, this.settings.general.showTimeLog && BDFDB.LibraryComponents.DateInput.format(this.settings.dates.logDate, timestamp)].filter(n => n).join("\n\n"), {
 										icon: avatar,
@@ -969,12 +1065,34 @@ module.exports = (_ => {
 							color: BDFDB.LibraryComponents.Button.Colors.RED,
 							size: BDFDB.LibraryComponents.Button.Sizes.TINY,
 							look: BDFDB.LibraryComponents.Button.Looks.OUTLINE,
-							style: {marginLeft: 6, marginRight: 12},
+							style: {marginLeft: 6, marginRight: 6},
 							children: BDFDB.LanguageUtils.LanguageStrings.CLEAR,
 							onClick: _ => BDFDB.ModalUtils.confirm(this, this.labels.clear_log, _ => {
 								timeLog = [];
 								timeLogList.props.entries = timeLog;
 								BDFDB.ReactUtils.forceUpdate(timeLogList);
+							})
+						}),
+						BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.TooltipContainer, {
+							text: "Open Log Folder",
+							children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Button, {
+								color: BDFDB.LibraryComponents.Button.Colors.BRAND,
+								size: BDFDB.LibraryComponents.Button.Sizes.TINY,
+								look: BDFDB.LibraryComponents.Button.Looks.OUTLINE,
+								style: {marginRight: 6},
+								children: "📁",
+								onClick: _ => (_this || this).openLogDirectory()
+							})
+						}),
+						BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.TooltipContainer, {
+							text: "Export Timelog",
+							children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Button, {
+								color: BDFDB.LibraryComponents.Button.Colors.BRAND,
+								size: BDFDB.LibraryComponents.Button.Sizes.TINY,
+								look: BDFDB.LibraryComponents.Button.Looks.FILLED,
+								style: {marginRight: 12},
+								children: "💾",
+								onClick: _ => (_this || this).openExportModal()
 							})
 						}),
 						BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.SearchBar, {
@@ -998,6 +1116,705 @@ module.exports = (_ => {
 						entries: timeLog
 					})
 				});
+			}
+
+			getDefaultLogDirectory () {
+				const path = require("path");
+				const homeDir = (typeof process != "undefined" && process.env && (process.env.HOME || process.env.USERPROFILE)) || "";
+				return path.join(homeDir, "Documents", "BetterDiscord", "FriendNotifications");
+			}
+
+			getLogDirectory () {
+				const custom = this.settings && this.settings.paths && typeof this.settings.paths.logDirectory == "string" && this.settings.paths.logDirectory.trim();
+				if (custom) return custom;
+				return this.getDefaultLogDirectory();
+			}
+
+			formatLogDate (timestamp) {
+				const d = new Date(timestamp || Date.now());
+				const pad = n => String(n).padStart(2, "0");
+				return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+			}
+
+			getStatusEmoji (status, mobile, special) {
+				if (special === "screensharing") return "🖥️";
+				if (special === "streaming") return "🟣";
+				if (special === "listening") return "🎵";
+				if (special === "playing") return "🎮";
+				switch (String(status).toLowerCase()) {
+					case "online": return "🟢";
+					case "idle": return "🟡";
+					case "dnd": return "🔴";
+					case "streaming": return "🟣";
+					case "offline":
+					case "invisible": return "⚫";
+					default: return "⚪";
+				}
+			}
+
+			formatLogEntryText (entry) {
+				const dateStr = this.formatLogDate(entry.timestamp);
+				const emoji = this.getStatusEmoji(entry.status, entry.mobile, entry.specialNotice);
+				const statusName = (entry.statusName || entry.status || "offline").toUpperCase();
+				const mobileTag = entry.mobile ? " 📱" : "";
+
+				const displayName = entry.name || entry.username || "Unknown";
+				const userTag = entry.username && entry.username !== displayName ? ` (@${entry.username})` : (entry.username ? ` (@${entry.username})` : "");
+				const nickTag = entry.nickname && entry.nickname !== displayName ? ` [Nick: ${entry.nickname}]` : "";
+				const userInfo = `${displayName}${userTag}${nickTag} [ID: ${entry.id || "N/A"}]`;
+
+				const msg = entry.message || (entry.string ? entry.string.replace(/<[^>]+>/g, "") : `Changed status to '${entry.status || "offline"}'`);
+
+				return `[${dateStr}] ${emoji} [${statusName}]${mobileTag} | ${userInfo} | ${msg}`;
+			}
+
+			ensureLogDirectory () {
+				try {
+					const fs = require("fs");
+					const path = require("path");
+					const dir = (_this || this).getLogDirectory();
+					if (!fs.existsSync(dir)) {
+						fs.mkdirSync(dir, { recursive: true });
+					}
+					const logFile = path.join(dir, "Log.txt");
+					if (!fs.existsSync(logFile)) {
+						fs.writeFileSync(logFile, "", "utf8");
+					}
+				} catch (e) {
+					console.error("[FriendNotifications] Failed to ensure log directory:", e);
+				}
+			}
+
+			writeLogToFile (entry) {
+				try {
+					const settings = (_this && _this.settings) || this.settings;
+					const shouldSave = !settings || !settings.general || settings.general.saveLogToFile !== false;
+					if (!shouldSave) return;
+					const line = (_this || this).formatLogEntryText(entry);
+					console.log("[FriendNotifications] Appending to Log.txt:", line);
+					(_this || this).queueLogWrite(line);
+				} catch (e) {
+					console.error("[FriendNotifications] writeLogToFile error:", e);
+				}
+			}
+
+			queueLogWrite (line) {
+				if (!this.logQueue) this.logQueue = [];
+				this.logQueue.push(line);
+
+				if (this.isWritingLog) return;
+				this.flushLogQueue();
+			}
+
+			flushLogQueue () {
+				if (!this.logQueue || !this.logQueue.length) return;
+				this.isWritingLog = true;
+
+				const linesToWrite = this.logQueue.join("\n") + "\n";
+				this.logQueue = [];
+
+				const fs = require("fs");
+				const path = require("path");
+				const logDir = (_this || this).getLogDirectory();
+				const logFile = path.join(logDir, "Log.txt");
+
+				try {
+					if (!fs.existsSync(logDir)) {
+						fs.mkdirSync(logDir, { recursive: true });
+					}
+					fs.appendFile(logFile, linesToWrite, "utf8", err => {
+						this.isWritingLog = false;
+						if (err) {
+							console.error("[FriendNotifications] Failed to write to Log.txt:", err);
+						} else {
+							console.log("[FriendNotifications] Successfully wrote to Log.txt:", logFile);
+						}
+						if (this.logQueue && this.logQueue.length > 0) {
+							this.flushLogQueue();
+						}
+					});
+				} catch (err) {
+					this.isWritingLog = false;
+					console.error("[FriendNotifications] flushLogQueue error:", err);
+				}
+			}
+
+			openLogDirectory () {
+				const dir = (_this || this).getLogDirectory();
+				const fs = require("fs");
+				try {
+					if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+				} catch (e) {
+					console.error("[FriendNotifications] Failed to create log directory:", e);
+				}
+
+				// Method 1: BdApi.openPath if available
+				try {
+					if (window.BdApi && typeof window.BdApi.openPath == "function") {
+						window.BdApi.openPath(dir);
+						BDFDB.NotificationUtils.toast(`Opened log folder: ${dir}`, {type: "info"});
+						return;
+					}
+				} catch (e) {}
+
+				// Method 2: BetterDiscord Main Process IPC (bd-open-path) - Always works on macOS & Windows
+				try {
+					const electron = require("electron");
+					if (electron && electron.ipcRenderer) {
+						electron.ipcRenderer.send("bd-open-path", dir);
+						BDFDB.NotificationUtils.toast(`Opened log folder: ${dir}`, {type: "info"});
+						return;
+					}
+				} catch (e) {}
+
+				// Method 3: electron.shell
+				try {
+					const electron = require("electron");
+					if (electron && electron.shell && typeof electron.shell.openPath == "function") {
+						electron.shell.openPath(dir);
+						BDFDB.NotificationUtils.toast(`Opened log folder: ${dir}`, {type: "info"});
+						return;
+					}
+				} catch (e) {}
+			}
+
+			async promptChooseFolder () {
+				const defaultPath = (_this || this).getLogDirectory();
+
+				if (window.BdApi && window.BdApi.UI && typeof window.BdApi.UI.openDialog == "function") {
+					try {
+						const res = await window.BdApi.UI.openDialog({
+							mode: "open",
+							openDirectory: true,
+							openFile: false,
+							title: "Select Log Directory",
+							defaultPath: defaultPath
+						});
+						if (res) {
+							if (res.canceled) return null;
+							if (res.filePaths && res.filePaths.length) return res.filePaths[0];
+						}
+					} catch (e) {
+						console.error("[FriendNotifications] BdApi.UI.openDialog choose folder error:", e);
+					}
+				}
+
+				try {
+					const electron = require("electron");
+					if (electron && electron.ipcRenderer) {
+						const res = await electron.ipcRenderer.invoke("bd-open-dialog", {
+							mode: "open",
+							openDirectory: true,
+							openFile: false,
+							title: "Select Log Directory",
+							defaultPath: defaultPath
+						});
+						if (res) {
+							if (res.canceled) return null;
+							if (res.filePaths && res.filePaths.length) return res.filePaths[0];
+						}
+					}
+				} catch (e) {
+					console.error("[FriendNotifications] electron.ipcRenderer bd-open-dialog error:", e);
+				}
+
+				return null;
+			}
+
+			async promptSaveFile (defaultName, format) {
+				const path = require("path");
+				const defaultPath = path.join((_this || this).getLogDirectory(), defaultName);
+
+				const extFilters = {
+					txt: [{ name: "Text Document (*.txt)", extensions: ["txt"] }, { name: "All Files (*.*)", extensions: ["*"] }],
+					xlsx: [{ name: "Excel Spreadsheet (*.xlsx)", extensions: ["xlsx"] }, { name: "All Files (*.*)", extensions: ["*"] }],
+					csv: [{ name: "CSV Spreadsheet (*.csv)", extensions: ["csv"] }, { name: "All Files (*.*)", extensions: ["*"] }],
+					md: [{ name: "Markdown Document (*.md)", extensions: ["md"] }, { name: "All Files (*.*)", extensions: ["*"] }]
+				};
+				const filters = extFilters[format] || extFilters.txt;
+
+				// 1. BdApi.UI.openDialog
+				if (window.BdApi && window.BdApi.UI && typeof window.BdApi.UI.openDialog == "function") {
+					try {
+						const res = await window.BdApi.UI.openDialog({
+							mode: "save",
+							title: `Save Timelog Export (${(format || "txt").toUpperCase()})`,
+							defaultPath: defaultPath,
+							filters: filters
+						});
+						if (res) {
+							if (res.canceled) return null;
+							if (res.filePath) return res.filePath;
+						}
+					} catch (e) {}
+				}
+
+				// 2. BetterDiscord IPC (bd-open-dialog)
+				try {
+					const electron = require("electron");
+					if (electron && electron.ipcRenderer) {
+						const res = await electron.ipcRenderer.invoke("bd-open-dialog", {
+							mode: "save",
+							title: `Save Timelog Export (${(format || "txt").toUpperCase()})`,
+							defaultPath: defaultPath,
+							filters: filters
+						});
+						if (res) {
+							if (res.canceled) return null;
+							if (res.filePath) return res.filePath;
+						}
+					}
+				} catch (e) {}
+
+				return defaultPath;
+			}
+
+			openExportMenu (event) {
+				if (event) {
+					event.preventDefault();
+					if (typeof event.stopPropagation == "function") event.stopPropagation();
+				}
+				const currentEntries = (timeLogList && timeLogList.props && timeLogList.props.entries) || timeLog || [];
+				if (!currentEntries.length) {
+					BDFDB.NotificationUtils.toast("No timelog entries available to export.", {type: "warning"});
+					return;
+				}
+
+				const menuItems = [
+					{
+						type: "item",
+						id: "export-txt",
+						label: "Text Document (.txt) — Default",
+						action: () => this.handleExportWithSaveDialog("txt", currentEntries)
+					},
+					{
+						type: "item",
+						id: "export-xlsx",
+						label: "Excel Spreadsheet (.xlsx)",
+						action: () => this.handleExportWithSaveDialog("xlsx", currentEntries)
+					},
+					{
+						type: "item",
+						id: "export-csv",
+						label: "CSV Spreadsheet (.csv)",
+						action: () => this.handleExportWithSaveDialog("csv", currentEntries)
+					},
+					{
+						type: "item",
+						id: "export-md",
+						label: "Markdown Document (.md)",
+						action: () => this.handleExportWithSaveDialog("md", currentEntries)
+					},
+					{
+						type: "separator"
+					},
+					{
+						type: "item",
+						id: "open-log-dir",
+						label: "Open Log Directory",
+						action: () => this.openLogDirectory()
+					}
+				];
+
+				// Method 1: BdApi.ContextMenu (official BetterDiscord ContextMenu API)
+				if (window.BdApi && window.BdApi.ContextMenu && typeof window.BdApi.ContextMenu.open == "function" && typeof window.BdApi.ContextMenu.buildMenu == "function") {
+					try {
+						const nativeEvent = (event && event.nativeEvent) || event;
+						window.BdApi.ContextMenu.open(nativeEvent, window.BdApi.ContextMenu.buildMenu(menuItems));
+						return;
+					} catch (err) {}
+				}
+
+				// Method 2: BDFDB ContextMenuUtils
+				if (BDFDB.ContextMenuUtils && typeof BDFDB.ContextMenuUtils.open == "function") {
+					try {
+						const nativeEvent = (event && event.nativeEvent) || event;
+						const bdfdbItems = [
+							BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuGroup, {
+								children: [
+									BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
+										label: "Text Document (.txt) — Default",
+										id: BDFDB.ContextMenuUtils.createItemId(this.name, "export-txt"),
+										action: () => this.handleExportWithSaveDialog("txt", currentEntries)
+									}),
+									BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
+										label: "Excel Spreadsheet (.xlsx)",
+										id: BDFDB.ContextMenuUtils.createItemId(this.name, "export-xlsx"),
+										action: () => this.handleExportWithSaveDialog("xlsx", currentEntries)
+									}),
+									BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
+										label: "CSV Spreadsheet (.csv)",
+										id: BDFDB.ContextMenuUtils.createItemId(this.name, "export-csv"),
+										action: () => this.handleExportWithSaveDialog("csv", currentEntries)
+									}),
+									BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
+										label: "Markdown Document (.md)",
+										id: BDFDB.ContextMenuUtils.createItemId(this.name, "export-md"),
+										action: () => this.handleExportWithSaveDialog("md", currentEntries)
+									}),
+									BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
+										label: "Open Log Directory",
+										id: BDFDB.ContextMenuUtils.createItemId(this.name, "open-log-dir"),
+										action: () => this.openLogDirectory()
+									})
+								]
+							})
+						];
+						BDFDB.ContextMenuUtils.open(this, nativeEvent, bdfdbItems);
+						return;
+					} catch (err) {}
+				}
+
+				// Method 3: Fallback format modal with Dropdown
+				this.openExportModal(currentEntries);
+			}
+
+			openExportModal (entries) {
+				const entriesToExport = entries || (timeLogList && timeLogList.props && timeLogList.props.entries) || timeLog || [];
+				if (!entriesToExport.length) {
+					BDFDB.NotificationUtils.toast("No timelog entries available to export.", {type: "warning"});
+					return;
+				}
+
+				let selectedFormat = "txt";
+				const formatOptions = [
+					{ value: "txt", label: "📄 Plain Text (.txt) — Default" },
+					{ value: "xlsx", label: "📊 Microsoft Excel (.xlsx)" },
+					{ value: "csv", label: "📑 Comma Separated Values (.csv)" },
+					{ value: "md", label: "📝 Markdown Document (.md)" }
+				];
+
+				BDFDB.ModalUtils.open(this, {
+					size: "SMALL",
+					header: "Export Timelog",
+					subHeader: `Export ${entriesToExport.length} log ${entriesToExport.length === 1 ? "entry" : "entries"}`,
+					buttons: [
+						{
+							contents: "Cancel",
+							close: true,
+							cancel: true,
+							look: BDFDB.LibraryComponents.Button.Looks.LINK,
+							color: BDFDB.LibraryComponents.Button.Colors.PRIMARY
+						},
+						{
+							contents: "Open Folder",
+							close: false,
+							look: BDFDB.LibraryComponents.Button.Looks.OUTLINE,
+							color: BDFDB.LibraryComponents.Button.Colors.BRAND,
+							click: _ => (_this || this).openLogDirectory()
+						},
+						{
+							contents: "Save As...",
+							close: true,
+							color: BDFDB.LibraryComponents.Button.Colors.BRAND,
+							click: _ => {
+								(_this || this).handleExportWithSaveDialog(selectedFormat || "txt", entriesToExport);
+							}
+						}
+					],
+					children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Flex, {
+						direction: BDFDB.LibraryComponents.Flex.Direction.VERTICAL,
+						children: [
+							BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.FormComponents.FormItem, {
+								title: "Select Export Format:",
+								className: BDFDB.disCN.marginbottom16,
+								children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Select, {
+									value: selectedFormat,
+									options: formatOptions,
+									searchable: false,
+									onChange: opt => {
+										selectedFormat = (opt && opt.value) || opt || "txt";
+									}
+								})
+							}),
+							BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.TextElement, {
+								color: BDFDB.LibraryComponents.TextElement.Colors.MUTED,
+								size: BDFDB.LibraryComponents.TextElement.Sizes.SIZE_14,
+								children: "Default format is Plain Text (.txt). Click 'Save As...' to choose the target file location."
+							})
+						]
+					})
+				});
+			}
+
+			async handleExportWithSaveDialog (format = "txt", entries) {
+				if (!entries || !entries.length) {
+					BDFDB.NotificationUtils.toast("No timelog entries available to export.", {type: "warning"});
+					return;
+				}
+
+				format = (format || "txt").toLowerCase();
+				const now = new Date();
+				const pad = n => String(n).padStart(2, "0");
+				const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+				const defaultName = `Timelog_${dateStr}.${format}`;
+
+				const targetPath = await this.promptSaveFile(defaultName, format);
+				if (!targetPath) return;
+
+				const fs = require("fs");
+				const path = require("path");
+
+				try {
+					const targetDir = path.dirname(targetPath);
+					if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+
+					switch (format) {
+						case "csv":
+							fs.writeFileSync(targetPath, this.generateCsvContent(entries), "utf8");
+							break;
+						case "xlsx":
+							fs.writeFileSync(targetPath, this.generateXlsxBuffer(entries));
+							break;
+						case "md":
+							fs.writeFileSync(targetPath, this.generateMdContent(entries), "utf8");
+							break;
+						case "txt":
+						default:
+							fs.writeFileSync(targetPath, this.generateTxtContent(entries), "utf8");
+							break;
+					}
+
+					const fileName = path.basename(targetPath);
+					BDFDB.NotificationUtils.toast(`Successfully saved ${entries.length} entries to ${fileName}`, {type: "success"});
+				} catch (err) {
+					BDFDB.NotificationUtils.toast(`Export failed: ${err.message}`, {type: "danger"});
+				}
+			}
+
+			exportTimeLog (format, entries) {
+				return this.handleExportWithSaveDialog(format, entries);
+			}
+
+			generateCsvContent (entries) {
+				const headers = ["Timestamp", "Date & Time", "Status", "Emoji", "Mobile", "Display Name", "Username", "Nickname", "User ID", "Details"];
+				const escapeCsv = val => {
+					let str = String(val ?? "");
+					if (str.includes(",") || str.includes('"') || str.includes("\n") || str.includes("\r")) {
+						str = `"${str.replace(/"/g, '""')}"`;
+					}
+					return str;
+				};
+
+				const rows = entries.map(e => [
+					e.timestamp,
+					this.formatLogDate(e.timestamp),
+					(e.statusName || e.status || "").toUpperCase(),
+					this.getStatusEmoji(e.status, e.mobile, e.specialNotice),
+					e.mobile ? "true" : "false",
+					e.name || "",
+					e.username || "",
+					e.nickname || "",
+					e.id || "",
+					e.message || (e.string ? e.string.replace(/<[^>]+>/g, "") : "")
+				]);
+
+				const csvLines = [headers.map(escapeCsv).join(",")];
+				for (const row of rows) {
+					csvLines.push(row.map(escapeCsv).join(","));
+				}
+				return "\uFEFF" + csvLines.join("\r\n");
+			}
+
+			generateTxtContent (entries) {
+				const header = [
+					"================================================================================",
+					"FriendNotifications - LogIn/-Out Timelog Export",
+					`Export Date: ${this.formatLogDate(Date.now())}`,
+					`Total Entries: ${entries.length}`,
+					"================================================================================\n"
+				].join("\n");
+
+				const lines = entries.map(e => this.formatLogEntryText(e));
+				return header + lines.join("\n") + "\n";
+			}
+
+			generateMdContent (entries) {
+				const escapeMd = val => String(val ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
+				const header = [
+					"# 📋 FriendNotifications — Timelog Export\n",
+					`- **Exported At:** \`${this.formatLogDate(Date.now())}\``,
+					`- **Total Records:** \`${entries.length}\`\n`,
+					"| Date & Time | Status | User | User ID | Mobile | Details |",
+					"| :--- | :--- | :--- | :--- | :---: | :--- |"
+				];
+
+				const rows = entries.map(e => {
+					const date = this.formatLogDate(e.timestamp);
+					const emoji = this.getStatusEmoji(e.status, e.mobile, e.specialNotice);
+					const status = `${emoji} ${(e.statusName || e.status || "").toUpperCase()}`;
+					const user = escapeMd(e.name || e.username || "Unknown") + (e.username && e.username !== e.name ? ` (@${escapeMd(e.username)})` : "");
+					const id = `\`${e.id || ""}\``;
+					const mobile = e.mobile ? "📱 Yes" : "—";
+					const details = escapeMd(e.message || (e.string ? e.string.replace(/<[^>]+>/g, "") : ""));
+					return `| ${date} | ${status} | ${user} | ${id} | ${mobile} | ${details} |`;
+				});
+
+				return header.concat(rows).join("\n") + "\n";
+			}
+
+			generateXlsxBuffer (entries) {
+				const crcTable = new Int32Array(256);
+				for (let i = 0; i < 256; i++) {
+					let c = i;
+					for (let k = 0; k < 8; k++) c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1));
+					crcTable[i] = c;
+				}
+				const calcCrc32 = buf => {
+					let crc = 0 ^ (-1);
+					for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ crcTable[(crc ^ buf[i]) & 0xFF];
+					return (crc ^ (-1)) >>> 0;
+				};
+
+				const createZip = files => {
+					const localHeaders = [];
+					const cdEntries = [];
+					let offset = 0;
+
+					for (const file of files) {
+						const dataBuf = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data, "utf8");
+						const crc = calcCrc32(dataBuf);
+						const size = dataBuf.length;
+						const nameBuf = Buffer.from(file.name, "utf8");
+
+						const lh = Buffer.alloc(30 + nameBuf.length);
+						lh.writeUInt32LE(0x04034b50, 0);
+						lh.writeUInt16LE(20, 4);
+						lh.writeUInt16LE(0, 6);
+						lh.writeUInt16LE(0, 8); // Method 0 = STORED (no compression, zero zlib dependency)
+						lh.writeUInt16LE(0, 10);
+						lh.writeUInt16LE(0, 12);
+						lh.writeUInt32LE(crc, 14);
+						lh.writeUInt32LE(size, 18);
+						lh.writeUInt32LE(size, 22);
+						lh.writeUInt16LE(nameBuf.length, 26);
+						lh.writeUInt16LE(0, 28);
+						nameBuf.copy(lh, 30);
+						localHeaders.push(lh, dataBuf);
+
+						const cd = Buffer.alloc(46 + nameBuf.length);
+						cd.writeUInt32LE(0x02014b50, 0);
+						cd.writeUInt16LE(20, 4);
+						cd.writeUInt16LE(20, 6);
+						cd.writeUInt16LE(0, 8);
+						cd.writeUInt16LE(0, 10); // Method 0 = STORED
+						cd.writeUInt16LE(0, 12);
+						cd.writeUInt16LE(0, 14);
+						cd.writeUInt32LE(crc, 16);
+						cd.writeUInt32LE(size, 20);
+						cd.writeUInt32LE(size, 24);
+						cd.writeUInt16LE(nameBuf.length, 28);
+						cd.writeUInt16LE(0, 30);
+						cd.writeUInt16LE(0, 32);
+						cd.writeUInt16LE(0, 34);
+						cd.writeUInt16LE(0, 36);
+						cd.writeUInt32LE(0, 38);
+						cd.writeUInt32LE(offset, 42);
+						nameBuf.copy(cd, 46);
+						cdEntries.push(cd);
+
+						offset += lh.length + dataBuf.length;
+					}
+
+					const cdSize = cdEntries.reduce((acc, b) => acc + b.length, 0);
+					const eocd = Buffer.alloc(22);
+					eocd.writeUInt32LE(0x06054b50, 0);
+					eocd.writeUInt16LE(0, 4);
+					eocd.writeUInt16LE(0, 6);
+					eocd.writeUInt16LE(files.length, 8);
+					eocd.writeUInt16LE(files.length, 10);
+					eocd.writeUInt32LE(cdSize, 12);
+					eocd.writeUInt32LE(offset, 16);
+					eocd.writeUInt16LE(0, 20);
+
+					return Buffer.concat([...localHeaders, ...cdEntries, eocd]);
+				};
+
+				const escapeXml = str => String(str ?? "")
+					.replace(/&/g, "&amp;")
+					.replace(/</g, "&lt;")
+					.replace(/>/g, "&gt;")
+					.replace(/"/g, "&quot;")
+					.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+
+				const colLetter = colIdx => {
+					let letter = "";
+					while (colIdx >= 0) {
+						letter = String.fromCharCode((colIdx % 26) + 65) + letter;
+						colIdx = Math.floor(colIdx / 26) - 1;
+					}
+					return letter;
+				};
+
+				const headers = ["Timestamp", "Date & Time", "Status", "Emoji", "Mobile", "Display Name", "Username", "Nickname", "User ID", "Details"];
+				const rows = entries.map(e => [
+					e.timestamp ? String(e.timestamp) : "",
+					this.formatLogDate(e.timestamp),
+					(e.statusName || e.status || "").toUpperCase(),
+					this.getStatusEmoji(e.status, e.mobile, e.specialNotice),
+					e.mobile ? "Yes" : "No",
+					e.name || "",
+					e.username || "",
+					e.nickname || "",
+					e.id || "",
+					e.message || (e.string ? e.string.replace(/<[^>]+>/g, "") : "")
+				]);
+
+				let sheetDataXml = "<sheetData>";
+				let r = 1;
+				sheetDataXml += `<row r="${r}">`;
+				headers.forEach((h, col) => {
+					sheetDataXml += `<c r="${colLetter(col)}${r}" t="inlineStr"><is><t>${escapeXml(h)}</t></is></c>`;
+				});
+				sheetDataXml += `</row>`;
+
+				rows.forEach(row => {
+					r++;
+					sheetDataXml += `<row r="${r}">`;
+					row.forEach((val, col) => {
+						sheetDataXml += `<c r="${colLetter(col)}${r}" t="inlineStr"><is><t>${escapeXml(val)}</t></is></c>`;
+					});
+					sheetDataXml += `</row>`;
+				});
+				sheetDataXml += "</sheetData>";
+
+				const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>`;
+
+				const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+
+				const wbRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>`;
+
+				const workbook = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="TimeLog" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>`;
+
+				const sheet1 = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  ${sheetDataXml}
+</worksheet>`;
+
+				return createZip([
+					{ name: "[Content_Types].xml", data: contentTypes },
+					{ name: "_rels/.rels", data: rels },
+					{ name: "xl/_rels/workbook.xml.rels", data: wbRels },
+					{ name: "xl/workbook.xml", data: workbook },
+					{ name: "xl/worksheets/sheet1.xml", data: sheet1 }
+				]);
 			}
 
 			setLabelsByLanguage () {
